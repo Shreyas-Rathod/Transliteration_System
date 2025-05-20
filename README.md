@@ -80,10 +80,11 @@ Make sure to update paths to your data in the scripts accordingly.
 
 ---
 
-## WandB Experiments
+## WandB Experiments & Report Link
 
 All experiment tracking and visualizations were performed using [Weights & Biases](https://wandb.ai/). The visualizations and plots for hyperparameter sweeps and model performance are available in WandB project: `CS24M046_DA6401_A3_t1`.
 
+https://api.wandb.ai/links/cs24m046-indian-institute-of-technology-madras/kb2f5xnu
 
 ---
 
