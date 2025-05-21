@@ -1,255 +1,112 @@
+
 import numpy as np
-import matplotlib.pyplot as plt
-import tensorflow as tf
-from tensorflow.keras.models import Sequential, Model
-from tensorflow.keras.layers import LSTM, Dense, Embedding
-from PIL import Image
-import random
-import string
-import io
-import wandb
+import pandas as pd
+import json
+import os
 
-wandb.init(project="DA6401", name="lstm_attention_visualization")
+# ─── Configuration ────────────────────────────────────────────
 
-def generate_dataset(size=1000, min_length=5, max_length=15):
-    data = []
-    for _ in range(size):
-        length = random.randint(min_length, max_length)
-        s = ''.join(random.choice(string.ascii_lowercase) for _ in range(length))
-        data.append(s)
-    return data
+# CSV with your test predictions:
+# must have columns: input (source string), target (true target), pred (model prediction)
+PRED_CSV = "predictions_attention.csv"
 
-data = generate_dataset()
+# NumPy file with attention weights:
+# shape = (N_examples, T_output, S_input)
+# must correspond in order to rows of PRED_CSV
+ATTN_NPY = "attention_weights.npy"
 
-all_chars = sorted(list(set(''.join(data))))
-char_to_idx = {c: i for i, c in enumerate(all_chars)}
-idx_to_char = {i: c for i, c in enumerate(all_chars)}
-vocab_size = len(all_chars)
+# Output HTML
+OUT_HTML = "attention_viz.html"
 
-X = []
-y = []
-max_len = 10
 
-for text in data:
-    for i in range(0, len(text) - max_len):
-        X.append([char_to_idx[c] for c in text[i:i+max_len]])
-        y.append(char_to_idx[text[i+max_len]])
+# ─── Load Data ────────────────────────────────────────────────
 
-X = np.array(X)
-y = np.array(y)
+if not os.path.isfile(PRED_CSV):
+    raise FileNotFoundError(f"Could not find {PRED_CSV}")
+if not os.path.isfile(ATTN_NPY):
+    raise FileNotFoundError(f"Could not find {ATTN_NPY}")
 
-y_onehot = np.zeros((len(y), vocab_size))
-for i, label in enumerate(y):
-    y_onehot[i, label] = 1
+# Read predictions
+df = pd.read_csv(PRED_CSV)
+# Ensure columns exist
+for col in ("input","target","pred"):
+    if col not in df.columns:
+        raise ValueError(f"{PRED_CSV} must contain column '{col}'")
 
-X_train, X_val, y_train, y_val = train_test_split(X, y_onehot, test_size=0.2, random_state=42)
+input_texts  = df["input"].astype(str).tolist()
+target_texts = df["target"].astype(str).tolist()
+pred_texts   = df["pred"].astype(str).tolist()
 
-class CustomLSTM(tf.keras.layers.LSTM):
-    def __init__(self, units, return_sequences=False, **kwargs):
-        super(CustomLSTM, self).__init__(units, return_sequences=return_sequences, **kwargs)
-        self.activations = None
-        self.inputs = None
-        
-    def call(self, inputs, **kwargs):
-        self.inputs = inputs
-        outputs = super(CustomLSTM, self).call(inputs, **kwargs)
-        return outputs
-        
-    def get_config(self):
-        config = super(CustomLSTM, self).get_config()
-        return config
+# Load attention weights
+attn = np.load(ATTN_NPY)  # shape (N, T, S)
 
-embedding_dim = 32
-lstm_units = 64
+N = len(input_texts)
+if attn.shape[0] != N:
+    raise ValueError(f"attention_weights.npy has {attn.shape[0]} examples but {PRED_CSV} has {N}")
 
-model = Sequential([
-    Embedding(vocab_size, embedding_dim, input_length=max_len),
-    CustomLSTM(lstm_units),
-    Dense(vocab_size, activation='softmax')
-])
+# ─── Build HTML ───────────────────────────────────────────────
 
-model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+html = []
+html.append("<!DOCTYPE html>")
+html.append("<html><head><meta charset='utf-8'><title>Attention Connectivity</title>")
+html.append("<style>")
+html.append(" body { font-family: sans-serif; padding: 20px; }")
+html.append(" .sample { margin-bottom: 2em; }")
+html.append(" .charspan { font-family: monospace; display:inline-block; padding:4px; }")
+html.append(" .output .charspan:hover { background:#eee; text-decoration:underline; cursor:pointer; }")
+html.append("</style>")
+html.append("</head><body>")
+html.append("<h1>Seq2Seq Attention Connectivity</h1>")
+html.append("<p>Hover over an <strong>output</strong> character to see which <strong>input</strong> chars it attended to.</p>")
 
-model.build((None, max_len))
-print(model.summary())
+for i in range(N):
+    src = input_texts[i]
+    tgt = pred_texts[i]   # visualize model’s prediction
+    W   = attn[i]         # shape (T, S)
 
-lstm_layer = model.layers[1]
+    html.append(f"<div class='sample' id='sample{i}'>")
+    html.append(f"<h2>Sample {i+1}</h2>")
+    html.append("<div><strong>Input:</strong> ")
+    html.append("<span class='input'>")
+    for c in src:
+        html.append(f"<span class='charspan'>{c}</span>")
+    html.append("</span></div>")
 
-batch_size = 128
-epochs = 3
+    html.append("<div><strong>Output:</strong> ")
+    html.append("<span class='output'>")
+    for c in tgt:
+        html.append(f"<span class='charspan'>{c}</span>")
+    html.append("</span></div>")
 
-class ActivationLogger(tf.keras.callbacks.Callback):
-    def __init__(self, input_model, lstm_layer, val_data, idx_to_char, log_freq=1):
-        super(ActivationLogger, self).__init__()
-        self._model = input_model
-        self.lstm_layer = lstm_layer
-        self.val_data = val_data
-        self.idx_to_char = idx_to_char
-        self.log_freq = log_freq
-        
-        self.activation_model = None
-        
-    def on_train_begin(self, logs=None):
-        self.activation_model = Model(
-            inputs=self._model.input,
-            outputs=[self._model.layers[0].output, self.lstm_layer.output]
-        )
-        
-    def on_epoch_end(self, epoch, logs=None):
-        if epoch % self.log_freq == 0:
-            self.log_activations(epoch)
-            
-    def log_activations(self, epoch):
-        sample_idx = np.random.randint(0, len(self.val_data[0]))
-        input_seq = self.val_data[0][sample_idx:sample_idx+1]
-        
-        embeddings, lstm_output = self.activation_model.predict(input_seq)
-        
-        attention_map = self.create_attention_visualization(input_seq[0], lstm_output[0])
-        
-        wandb.log({
-            f"attention_map_epoch_{epoch}": wandb.Image(attention_map),
-            "epoch": epoch
-        })
-        
-    def create_attention_visualization(self, input_seq, lstm_output):
-        input_chars = [self.idx_to_char[idx] for idx in input_seq]
-        
-        input_tensor = np.array([input_seq])
-        predictions = self._model.predict(input_tensor)[0]
-        predicted_chars = [self.idx_to_char[np.argmax(pred)] for pred in [predictions]]
-        
-        emb_model = Model(inputs=self._model.input, outputs=self._model.layers[0].output)
-        embeddings = emb_model.predict(input_tensor)[0]
-        
-        correlation_matrix = np.zeros((1, len(input_chars)))
-        
-        lstm_output_flat = lstm_output.reshape(1, -1)
-        for i in range(len(input_chars)):
-            emb_flat = embeddings[i].reshape(1, -1)
-            similarity = np.dot(lstm_output_flat, emb_flat.T) / (
-                np.linalg.norm(lstm_output_flat) * np.linalg.norm(emb_flat)
-            )
-            correlation_matrix[0, i] = similarity
-            
-        plt.figure(figsize=(10, 4))
-        plt.imshow(correlation_matrix, cmap='viridis')
-        plt.xticks(range(len(input_chars)), input_chars)
-        plt.xlabel('Input Characters')
-        plt.yticks([0], [f"Predicted: '{predicted_chars[0]}'"])
-        plt.ylabel('Output Character')
-        plt.title('Character-Level Attention Map')
-        plt.colorbar(label='Attention Weight')
-        plt.tight_layout()
-        
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png')
-        plt.close()
-        buf.seek(0)
-        
-        return Image.open(buf)
+    # Embed the attention weights for this sample
+    html.append("<script>")
+    html.append(f"  (function(){{")
+    html.append(f"    var W = {json.dumps(W.tolist())};")
+    html.append(f"    var inp = document.querySelectorAll('#sample{i} .input .charspan');")
+    html.append(f"    var out = document.querySelectorAll('#sample{i} .output .charspan');")
+    html.append(f"    out.forEach((span, t) => {{")
+    html.append(f"      span.addEventListener('mouseover', () => {{")
+    html.append(f"        var row = W[t];")
+    html.append(f"        var maxw = Math.max(...row);")
+    html.append(f"        row.forEach((w, s) => {{")
+    html.append(f"          var alpha = (maxw>0 ? w/maxw : 0);")
+    html.append(f"          inp[s].style.backgroundColor = 'rgba(0,255,0,' + alpha.toFixed(3) + ')';")
+    html.append(f"          inp[s].title = w.toFixed(3);")
+    html.append(f"        }});")
+    html.append(f"      }});")
+    html.append(f"      span.addEventListener('mouseout', () => {{")
+    html.append(f"        inp.forEach(el => {{ el.style.backgroundColor=''; el.title=''; }});")
+    html.append(f"      }});")
+    html.append(f"    }});")
+    html.append(f"  }})();")
+    html.append("</script>")
 
-activation_logger = ActivationLogger(
-    input_model=model,
-    lstm_layer=lstm_layer,
-    val_data=(X_val, y_val),
-    idx_to_char=idx_to_char,
-    log_freq=1
-)
+    html.append("</div>")  # end sample
 
-wandb_callback = wandb.keras.WandbCallback()
+html.append("</body></html>")
 
-history = model.fit(
-    X_train, y_train,
-    batch_size=batch_size,
-    epochs=epochs,
-    validation_data=(X_val, y_val),
-    callbacks=[activation_logger, wandb_callback]
-)
+# Write to file
+with open(OUT_HTML, "w", encoding="utf-8") as f:
+    f.write("\n".join(html))
 
-def create_detailed_attention_visualization(model, input_text, char_to_idx, idx_to_char):
-    input_seq = [char_to_idx.get(c, 0) for c in input_text]
-    if len(input_seq) > max_len:
-        input_seq = input_seq[:max_len]
-    elif len(input_seq) < max_len:
-        input_seq = [0] * (max_len - len(input_seq)) + input_seq
-        
-    emb_model = Model(inputs=model.input, outputs=model.layers[0].output)
-    
-    lstm_layer = model.layers[1]
-    
-    input_tensor = np.array([input_seq])
-    embeddings = emb_model.predict(input_tensor)[0]
-    
-    output_text = ""
-    current_input = input_tensor.copy()
-    
-    attention_matrix = np.zeros((len(input_text), max_len))
-    
-    for i in range(max_len):
-        pred = model.predict(current_input)[0]
-        next_char_idx = np.argmax(pred)
-        next_char = idx_to_char[next_char_idx]
-        output_text += next_char
-        
-        lstm_output_model = Model(inputs=model.input, outputs=lstm_layer.output)
-        lstm_output = lstm_output_model.predict(current_input)[0]
-        
-        for j in range(len(input_text)):
-            lstm_output_flat = lstm_output.reshape(1, -1)
-            emb_flat = embeddings[j].reshape(1, -1)
-            similarity = np.dot(lstm_output_flat, emb_flat.T) / (
-                np.linalg.norm(lstm_output_flat) * np.linalg.norm(emb_flat)
-            )
-            attention_matrix[j, i] = similarity[0, 0]
-            
-        new_seq = list(current_input[0])
-        new_seq = new_seq[1:] + [next_char_idx]
-        current_input[0] = np.array(new_seq)
-        
-    plt.figure(figsize=(12, 10))
-    plt.imshow(attention_matrix, cmap='viridis', aspect='auto')
-    plt.xticks(range(len(output_text)), list(output_text))
-    plt.xlabel('Output Characters (Predicted)')
-    plt.yticks(range(len(input_text)), list(input_text))
-    plt.ylabel('Input Characters')
-    plt.title('Character-Level Attention Map (Connectivity Visualization)')
-    plt.colorbar(label='Attention Weight')
-    plt.tight_layout()
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    plt.close()
-    buf.seek(0)
-    
-    return Image.open(buf), output_text
-
-sample_input = "hello world"
-final_vis, output_text = create_detailed_attention_visualization(
-    model, sample_input, char_to_idx, idx_to_char
-)
-
-wandb.log({
-    "final_attention_visualization": wandb.Image(final_vis),
-    "input_text": sample_input,
-    "predicted_text": output_text
-})
-
-model.save("lstm_attention_model.h5")
-wandb.save("lstm_attention_model.h5")
-
-wandb.log({
-    "model_summary": str(model.summary()),
-    "epochs": epochs,
-    "batch_size": batch_size,
-    "embedding_dim": embedding_dim,
-    "lstm_units": lstm_units,
-    "vocabulary_size": vocab_size,
-    "max_sequence_length": max_len
-})
-
-print("Training complete. Visualizations available in W&B.")
-print(f"W&B project: {wandb.run.project}")
-print(f"W&B run: {wandb.run.name}")
-
-wandb.finish()
+print(f"✅ Attention visualization written to {OUT_HTML}")
